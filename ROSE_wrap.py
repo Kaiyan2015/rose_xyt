@@ -1,0 +1,238 @@
+#!/usr/bin/env python2.7
+"""Wrapper script to run ROSE on unprocessed BAM and bed files (e.g. coming 
+from Chilin output)
+"""
+import os
+import sys
+import stat
+from optparse import OptionParser
+import subprocess
+import pkg_resources
+
+def processBed(bedFile):
+    """Given the file path of a un-processed bedfile, this fn will
+    1. sort the bed file by the peak score (in the 5th col)
+    NOTE: in descending order
+    2. cut down the file to take only the first 5 cols
+    Output: a new file, <bedfile>_sorted.bed
+    """
+    #outfile = <bedfile>_sorted.bed, get the base name
+    outfile = bedFile.split(os.sep)[-1].split(".")[:-1]
+    outfile = ".".join(outfile) + "_sorted.bed"
+    call = "sort -nk 5,5 -r %s | cut -f1-5 - > %s" % (bedFile, outfile)
+
+    #check if file exists
+    if not os.path.exists(outfile):
+        print "processBed: %s" % call
+        subprocess.call(call, shell=True)
+    else:
+        print "processBed: skip- %s file already exists" % (outfile)
+
+    return outfile
+
+def processBam(bamFile, pe=False):
+    """Given a path to a bam file, this fn will:
+    1. use samtools to sort AND
+    2. use samtools to remove duplicates
+    
+    Output: a new bam file <bamfile>_sorted_nodup.bam
+    NOTE: only handles single-ended BAMS; to add paired end--see rmdup call
+    """
+    #outfile = <bamfile>_sorted_nodup.bam, get the base name
+    outfile = bamFile.split(os.sep)[-1].split(".")[:-1]
+    outfile = ".".join(outfile) + "_sorted_nodup.bam"
+    
+    #is the bam Paired-end or single-end (default)
+    peFlag = "" if pe else "-s"
+
+    call = "samtools sort -o %s tmp | samtools rmdup %s - %s" % \
+        (bamFile, peFlag, outfile)
+
+    if not os.path.exists(outfile):
+        print "processBam: %s" % call
+        subprocess.call(call, shell=True)
+    else:
+        print "processBam: skip- %s file already exists" % (outfile)
+
+    return outfile
+
+def indexBam(bamFile):
+    """calls: samtools index <bamfile>"""
+    #expected file is <bamfile>.bai
+    outfile = bamFile + ".bai"
+    call = "samtools index %s" % bamFile
+
+    if not os.path.exists(outfile):
+        print "indexBam: %s" % call
+        subprocess.call(call, shell=True)
+    else:
+        print "indexBam: skip- %s file already exists" % outfile
+
+    return outfile
+
+def genConfFile():
+    """Writes conf_file_template to rose.batch.conf and exits
+    NOTE: while the params are simple, we'll keep the contents as a string
+    NOTE: we have moved the template to a pkg resource
+    """
+    conf_file_template = pkg_resources.resource_string(__name__,'rose.batch.conf')
+    f = open("rose.batch.conf", "w")
+    f.write(conf_file_template)
+    f.close()
+
+def readConfFile(cfile):
+    """given a (path to a) batch conf file, will read in the comma-delimited 
+    file and tries its best to 1. generate a shell script rose.batch.conf.sh 
+    (OR whatever cfile is named) and then 2. runs the shell script
+    """
+    #use this map to tell us which param symbols to use
+    _map = ["-b", "-t", "-c", "--tpe", "--cpe", "-T", "-s", "-o", "-p", "-g"]
+    #prep out file
+    outf = open(cfile+".sh", "w")
+    outf.write("#!/bin/bash\n\n")
+    
+    #read in cfile
+    f = open(cfile)
+    for l in f:
+        #skip comments
+        if l.startswith("#"):
+            continue
+
+        params = l.strip().split(',')
+        #print params
+
+        #skip blank lines
+        if not l.strip():
+            continue
+        
+        #skip lines where not all the params/commas are present.
+        #NOTE: genome is always required and is the last param
+        if len(params) != len(_map):
+            print "SKIPPING MALFORMED: %s" % ",".join(params)
+            continue
+
+        first = True
+        for (i, p) in enumerate(params):
+            #print (i,p)
+            #using the fact that these come in fixed order
+            if p.strip():
+                if first:
+                    first = False
+                    outf.write("ROSE_wrap.py -b %s " % p.strip())
+                else:
+                    #HANDLE TPE/CPE flags
+                    if (_map[i] == "--tpe" or _map[i] == "--cpe"):
+                        if p.strip() != '0':
+                            outf.write("%s " % _map[i])
+                    else:
+                        outf.write("%s %s " % (_map[i], p.strip()))
+        if not first: outf.write("\n")
+        
+    f.close()
+    outf.close()
+
+    #execute the script
+    #make the script executable
+    st = os.stat(outf.name)
+    os.chmod(outf.name, st.st_mode | stat.S_IXUSR)
+
+    #finally: execute the shell script
+    call = "./%s" % outf.name
+    print "ROSE_wrap.py BATCH MODE: CALLING %s" % call
+    subprocess.call(call, shell=True)
+    
+def main():
+    _rose_version = pkg_resources.get_distribution('ROSE_cfce').version
+    _rose_main = pkg_resources.resource_filename(__name__,'ROSE_main_cfce.py')
+    _rose_gene = pkg_resources.resource_filename(__name__,'ROSE_geneMapper_cfce.py')
+    _preamble = "ROSE_wrap version %s" % _rose_version
+    _cwd = os.getcwd()
+
+    usage = "USAGE: %prog [options]"
+    optparser = OptionParser(usage=usage)
+    optparser.add_option("--gen", help="generate example batch conf file", default=False, action="store_true")
+    optparser.add_option("--batch", help="batch mode (use --gen to generate an example conf file)")
+    optparser.add_option("-b", "--bed", help="bed/narrowPeak file")
+    optparser.add_option("-t", "--treat", help="treatment bam file")
+    optparser.add_option("--tpe", help="treatment is paired end", default=False, action="store_true")
+    optparser.add_option("-c", "--cont", help="control bam file (optional)")
+    optparser.add_option("--cpe", help="control is paired end", default=False, action="store_true")
+    optparser.add_option("-T", "--tss", help="ROSE tss parameter (default:2500)", default="2500")
+    optparser.add_option("-s", "--stitch", help="ROSE stitch parameter (default:12500)", default="12500")
+    optparser.add_option("-o", "--output", help="output folder name (default: <auto-generated>)", default="")
+    optparser.add_option("-p", "--outputPath", help="absolute path to place output dir (default: current working dir)", default=_cwd)
+    optparser.add_option("-g", "--genome", help="ROSE genome parameter (choices: HG18,HG19,MM8,MM9,MM10")
+    optparser.add_option("-v", "--version", help="ROSE_wrap.py version", default=False, action="store_true")
+    (options, args) = optparser.parse_args(sys.argv)
+
+    if options.gen:
+        #Generate conf file and exit
+        genConfFile()
+        sys.exit()
+    
+    if options.batch:
+        readConfFile(options.batch)
+        sys.exit()
+        
+    if options.version:
+        print _preamble
+        sys.exit()
+
+    if not options.bed or not options.treat or not options.genome:
+        print _preamble
+        optparser.print_help()
+        sys.exit(-1)
+
+    #Control is optional
+    if options.cont:
+        sortedCont = processBam(options.cont, options.cpe)
+        cont = "--control %s" % sortedCont
+        tmp = indexBam(sortedCont)
+        if not options.output:
+            #set default
+            options.output = "ROSE_output_t%s_wCont" % options.tss
+    else:
+        cont = ""
+        if not options.output:
+            #set default
+            options.output = "ROSE_output_t%s_noCont" % options.tss
+    
+    #ACCOUNT for outputPath
+    options.output = os.path.join(options.outputPath, options.output)
+    #CHECK for directory existence
+    if not (os.path.exists(options.output) or os.path.isdir(options.output)):
+        os.makedirs(options.output)
+    #DO NOT change working dir to options.output, 
+    #breaks processBed, processBam, indexBam        
+    
+    sortedBed = processBed(options.bed)
+    sortedTreat = processBam(options.treat, options.tpe)
+    tmp = indexBam(sortedTreat)
+
+    #invoke ROSE
+    call = "python %s -i %s -r %s %s -t %s -s %s -g %s -o %s" % \
+        (_rose_main, os.path.abspath(sortedBed), 
+         os.path.abspath(sortedTreat), cont,
+         options.tss, options.stitch, options.genome, options.output)        
+    print call
+    subprocess.call(call, shell=True)
+    
+    #call ROSE_geneMapper
+    #locate the *_SuperEnhancers.table.txt
+    tmp = ""
+    for f in os.listdir(options.output):
+        if f.endswith("_SuperEnhancers.table.txt"):
+            tmp = os.path.join(options.output, f)
+            break
+
+    if tmp:
+        #build call
+        call = "python %s -i %s -g %s -o %s" % \
+            (_rose_gene, tmp, options.genome, options.output)
+        print call
+        subprocess.call(call, shell=True)
+    else:
+        print "WARNING: SuperEnhancers.table.txt output file not found; ROSE_geneMapper.py not called."
+
+if __name__=='__main__':
+    main()
